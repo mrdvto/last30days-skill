@@ -11,10 +11,17 @@ import math
 import re
 from typing import Any, Dict, List, Optional
 
-from . import dates, http, log
+from . import auth_safety, dates, http, log
 from .relevance import token_overlap_relevance as _compute_relevance
 
 SCRAPECREATORS_BASE = "https://api.scrapecreators.com/v1/threads"
+
+
+def _sc_base() -> str:
+    if SCRAPECREATORS_BASE != "https://api.scrapecreators.com/v1/threads":
+        return SCRAPECREATORS_BASE
+    from . import env
+    return f"{env.get_scrapecreators_base_url()}/v1/threads"
 
 # Depth configurations: how many results to fetch
 DEPTH_CONFIG = {
@@ -25,19 +32,21 @@ DEPTH_CONFIG = {
 
 
 def _log(msg: str):
-    log.source_log("Threads", msg)
+    log.source_log("Threads", msg, tty_only=False)
 
 
 def _extract_core_subject(topic: str) -> str:
-    """Extract core subject from verbose query for Threads search."""
-    from .query import extract_core_subject
-    _THREADS_NOISE = frozenset({
-        'best', 'top', 'good', 'great', 'awesome',
-        'latest', 'new', 'news', 'update', 'updates',
-        'trending', 'hottest', 'popular', 'viral',
-        'practices', 'features', 'recommendations', 'advice',
-    })
-    return extract_core_subject(topic, noise=_THREADS_NOISE)
+    """Extract core subject from verbose query for Threads search.
+
+    The ScrapeCreators Threads keyword endpoint only returns hits for short
+    (1-2 word) queries; 3+ words or leaked boolean operators (the planner
+    emits "A OR B") return zero. Strip boolean operators and cap to the two
+    most salient words.
+    """
+    from .query import SOCIAL_NOISE, extract_core_subject
+    core = extract_core_subject(topic, noise=SOCIAL_NOISE, max_words=2)
+    return " ".join(core.rstrip("?!.").split()[:2])
+
 
 
 def _parse_date(item: Dict[str, Any]) -> Optional[str]:
@@ -143,7 +152,12 @@ def search_threads(
     Returns:
         Dict with 'items' list and optional 'error'.
     """
-    if not token:
+    raw_token = token
+    clean_token, token_err = auth_safety.normalize_header_token(raw_token)
+    if token_err:
+        _log(f"ScrapeCreators error: {token_err}")
+        return {"items": [], "error": token_err}
+    if not clean_token:
         return {"items": [], "error": "No SCRAPECREATORS_API_KEY configured"}
 
     config = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
@@ -153,15 +167,16 @@ def search_threads(
 
     try:
         data = http.get(
-            f"{SCRAPECREATORS_BASE}/search",
-            params={"keyword": core_topic},
-            headers=http.scrapecreators_headers(token),
+            f"{_sc_base()}/search",
+            params={"query": core_topic},
+            headers=http.scrapecreators_headers(clean_token),
             timeout=30,
             retries=2,
         )
     except Exception as e:
-        _log(f"ScrapeCreators error: {e}")
-        return {"items": [], "error": f"{type(e).__name__}: {e}"}
+        safe_err = auth_safety.scrub_secrets(str(e), (raw_token, clean_token))
+        _log(f"ScrapeCreators error: {type(e).__name__}: {safe_err}")
+        return {"items": [], "error": f"{type(e).__name__}: {safe_err}"}
 
     # Extract items from response (try common SC response shapes)
     raw_items = (

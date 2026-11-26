@@ -1,6 +1,12 @@
+import io
 import json
+import os
 import unittest
+import urllib.error
+from unittest import mock
+from typing import get_args
 
+from lib import env
 from lib import providers
 
 
@@ -42,6 +48,55 @@ class ProvidersV3Tests(unittest.TestCase):
         self.assertEqual("local-score", runtime.rerank_model)
         self.assertIsNone(client)
 
+    def test_explicit_local_forces_local_runtime_even_with_keys(self):
+        runtime, client = providers.resolve_runtime(
+            {
+                "GOOGLE_API_KEY": "test-google",
+                "OPENAI_API_KEY": "test-openai",
+                "OPENAI_AUTH_STATUS": "ok",
+                "XAI_API_KEY": "test-xai",
+                "OPENROUTER_API_KEY": "test-or",
+                "LAST30DAYS_REASONING_PROVIDER": "local",
+            },
+            depth="default",
+        )
+        self.assertEqual("local", runtime.reasoning_provider)
+        self.assertEqual("deterministic", runtime.planner_model)
+        self.assertEqual("local-score", runtime.rerank_model)
+        self.assertIsNone(client)
+
+    def test_explicit_off_and_none_force_local_runtime(self):
+        for provider_val in ("off", "none", " LOCAL ", " Off "):
+            runtime, client = providers.resolve_runtime(
+                {
+                    "GOOGLE_API_KEY": "test-google",
+                    "LAST30DAYS_REASONING_PROVIDER": provider_val,
+                },
+                depth="default",
+            )
+            self.assertEqual("local", runtime.reasoning_provider)
+            self.assertEqual("deterministic", runtime.planner_model)
+            self.assertEqual("local-score", runtime.rerank_model)
+            self.assertIsNone(client)
+
+    def test_mock_runtime_supports_local_and_off(self):
+        for provider_val in ("local", "off", "none"):
+            runtime = providers.mock_runtime(
+                {"LAST30DAYS_REASONING_PROVIDER": provider_val},
+                depth="default",
+            )
+            self.assertEqual("local", runtime.reasoning_provider)
+            self.assertEqual("deterministic", runtime.planner_model)
+            self.assertEqual("local-score", runtime.rerank_model)
+
+    def test_pipeline_diagnose_reports_local_mode_when_forced_local(self):
+        from lib import pipeline
+        res = pipeline.diagnose(
+            {"GOOGLE_API_KEY": "test", "LAST30DAYS_REASONING_PROVIDER": "local"}
+        )
+        self.assertTrue(res["local_mode"])
+        self.assertEqual("local", res["reasoning_provider"])
+
     def test_explicit_gemini_without_key_still_raises(self):
         with self.assertRaises(RuntimeError):
             providers.resolve_runtime(
@@ -62,6 +117,15 @@ class ProvidersV3Tests(unittest.TestCase):
                 {"LAST30DAYS_REASONING_PROVIDER": "xai"},
                 depth="default",
             )
+
+    def test_codex_auth_is_not_supported_as_openai_provider_auth(self):
+        self.assertNotIn("codex", get_args(env.AuthSource))
+        self.assertFalse(hasattr(env, "AUTH_SOURCE_CODEX"))
+
+    def test_openai_provider_has_no_chatgpt_backend_route(self):
+        self.assertFalse(hasattr(providers, "CODEX_RESPONSES_URL"))
+        with self.assertRaises(TypeError):
+            providers.OpenAIClient("token", "codex", "acct")
 
 
 class TestExtractJson(unittest.TestCase):
@@ -86,6 +150,53 @@ class TestExtractJson(unittest.TestCase):
     def test_no_json_raises(self):
         with self.assertRaises(json.JSONDecodeError):
             providers.extract_json("no json here at all")
+
+    def test_valid_json_that_is_not_an_object_raises_value_error(self):
+        # Gemini's JSON mode allows a top-level array; a model that answers
+        # with a bare list (or null/number/string) must raise ValueError, which
+        # the planner and reranker catch to fall back, rather than return a
+        # non-dict that later blows up on `.get(...)`.
+        for text in (
+            '[{"candidate_id": "c1", "relevance": 80}]',
+            "null",
+            "42",
+            '"just a string"',
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    providers.extract_json(text)
+
+
+class GenerateJsonNonObjectFallbackTests(unittest.TestCase):
+    """A non-object JSON reply goes through the real generate_json path and
+    lands in the callers' existing fallback, instead of crashing the run."""
+
+    class _TextStub(providers.ReasoningClient):
+        name = "stub"
+
+        def __init__(self, text):
+            super().__init__()
+            self.text = text
+
+        def generate_text(self, model, prompt, *, tools=None, response_mime_type=None):
+            return self.text
+
+    def test_planner_falls_back_on_top_level_array(self):
+        import contextlib
+        from lib import planner
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            plan = planner.plan_query(
+                topic="Ghostty terminal tips",
+                available_sources=["reddit", "x"],
+                requested_sources=None,
+                depth="default",
+                provider=self._TextStub('[{"intent": "how_to", "subqueries": []}]'),
+                model="m",
+            )
+        self.assertIn("LLM planning failed", buf.getvalue())
+        self.assertTrue(plan.subqueries)
 
 
 class TestExtractOpenAIText(unittest.TestCase):
@@ -124,39 +235,273 @@ class TestExtractGeminiText(unittest.TestCase):
         self.assertEqual("", providers.extract_gemini_text({}))
 
 
-class TestParseSSEChunk(unittest.TestCase):
-    def test_valid_chunk(self):
-        chunk = 'data: {"type": "delta", "text": "hi"}'
-        result = providers._parse_sse_chunk(chunk)
-        self.assertEqual(result, {"type": "delta", "text": "hi"})
-
-    def test_done_sentinel(self):
-        self.assertIsNone(providers._parse_sse_chunk("data: [DONE]"))
-
-    def test_no_data_lines(self):
-        self.assertIsNone(providers._parse_sse_chunk("event: ping"))
-
-    def test_invalid_json(self):
-        self.assertIsNone(providers._parse_sse_chunk("data: {bad json"))
-
-
-class TestParseCodexStream(unittest.TestCase):
-    def test_response_completed_event(self):
-        stream = 'data: {"type": "response.completed", "response": {"output_text": "done"}}\n\n'
-        result = providers._parse_codex_stream(stream)
-        self.assertEqual(result["output_text"], "done")
-
-    def test_delta_text_accumulation(self):
-        stream = 'data: {"delta": "hel"}\n\ndata: {"delta": "lo"}\n\n'
-        result = providers._parse_codex_stream(stream)
-        text = providers.extract_openai_text(result)
-        self.assertEqual(text, "hello")
-
-    def test_empty_stream(self):
-        self.assertEqual({}, providers._parse_codex_stream(""))
-
-    def test_done_only_stream(self):
-        self.assertEqual({}, providers._parse_codex_stream("data: [DONE]\n\n"))
-
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveEndpointTests(unittest.TestCase):
+    """``*_BASE_URL`` accepts an API root as well as a full endpoint URL."""
+
+    def _resolve(self, value, env_var="OPENAI_BASE_URL", default=None):
+        default = default or providers.OPENAI_RESPONSES_URL
+        patched = {} if value is None else {env_var: value}
+        with mock.patch.dict(os.environ, patched, clear=True):
+            return providers.resolve_endpoint(env_var, default)
+
+    def test_unset_uses_default_endpoint(self):
+        self.assertEqual(providers.OPENAI_RESPONSES_URL, self._resolve(None))
+
+    def test_blank_value_uses_default_endpoint(self):
+        self.assertEqual(providers.OPENAI_RESPONSES_URL, self._resolve("   "))
+
+    def test_api_root_gets_endpoint_path_appended(self):
+        self.assertEqual(
+            "https://example.test/v1/responses",
+            self._resolve("https://example.test/v1"),
+        )
+
+    def test_trailing_slash_is_normalised(self):
+        self.assertEqual(
+            "https://example.test/v1/responses",
+            self._resolve("https://example.test/v1/"),
+        )
+
+    def test_full_endpoint_url_is_preserved(self):
+        self.assertEqual(
+            "https://example.test/v1/responses",
+            self._resolve("https://example.test/v1/responses"),
+        )
+
+    def test_full_endpoint_query_string_is_preserved(self):
+        endpoint = "https://example.test/v1/responses?tenant=acme"
+        self.assertEqual(endpoint, self._resolve(endpoint))
+
+    def test_custom_gateway_route_is_preserved(self):
+        endpoint = "https://example.test/proxy?tenant=acme"
+        self.assertEqual(endpoint, self._resolve(endpoint))
+
+    def test_api_root_query_string_stays_after_appended_path(self):
+        self.assertEqual(
+            "https://example.test/v1/responses?tenant=acme",
+            self._resolve("https://example.test/v1?tenant=acme"),
+        )
+
+    def test_openrouter_uses_chat_completions_path(self):
+        self.assertEqual(
+            "https://example.test/api/v1/chat/completions",
+            self._resolve(
+                "https://example.test/api/v1",
+                env_var="OPENROUTER_BASE_URL",
+                default=providers.OPENROUTER_URL,
+            ),
+        )
+
+    def test_openrouter_full_endpoint_url_is_preserved(self):
+        self.assertEqual(
+            "https://example.test/api/v1/chat/completions",
+            self._resolve(
+                "https://example.test/api/v1/chat/completions",
+                env_var="OPENROUTER_BASE_URL",
+                default=providers.OPENROUTER_URL,
+            ),
+        )
+
+
+class TestProviderUsage(unittest.TestCase):
+    def test_successful_http_request_reports_usage(self):
+        client = providers.OpenAIClient("dummy")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = json.dumps({
+            "output_text": "ok",
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        }).encode("utf-8")
+        with mock.patch.object(providers.http.urllib.request, "urlopen", return_value=response) as urlopen:
+            self.assertEqual("ok", client.generate_text("model", "prompt"))
+        self.assertEqual(1, urlopen.call_count)
+        self.assertEqual(
+            {"calls": 1, "promptTokens": 5, "completionTokens": 3, "totalTokens": 8},
+            client.total_usage,
+        )
+
+    def test_failed_request_makes_later_usage_incomplete(self):
+        client = providers.OpenAIClient("dummy")
+        response = {
+            "output_text": "ok",
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        }
+        with mock.patch.object(
+            providers.http, "post",
+            side_effect=[response, providers.http.HTTPError("timed out"), response],
+        ):
+            self.assertEqual("ok", client.generate_text("model", "prompt"))
+            with self.assertRaises(providers.http.HTTPError):
+                client.generate_text("model", "prompt")
+            self.assertEqual("ok", client.generate_text("model", "prompt"))
+        self.assertIsNone(client.total_usage)
+
+    def test_hidden_http_retry_makes_usage_incomplete(self):
+        client = providers.OpenAIClient("dummy")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = json.dumps({
+            "output_text": "ok",
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        }).encode("utf-8")
+        failed_attempt = urllib.error.HTTPError(
+            providers.OPENAI_RESPONSES_URL, 500, "server error", {}, io.BytesIO(b"{}"),
+        )
+        with mock.patch.object(providers.http.urllib.request, "urlopen", side_effect=[failed_attempt, response]) as urlopen:
+            with mock.patch.object(providers.http.time, "sleep"):
+                self.assertEqual("ok", client.generate_text("model", "prompt"))
+        self.assertEqual(2, urlopen.call_count)
+        self.assertIsNone(client.total_usage)
+
+    def test_gemini_counts_all_calls_including_thought_tokens(self):
+        client = providers.GeminiClient("dummy-key")
+        responses = [
+            {
+                "candidates": [{"content": {"parts": [{"text": "first"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 4,
+                    "thoughtsTokenCount": 6,
+                    "totalTokenCount": 20,
+                },
+            },
+            {
+                "candidates": [{"content": {"parts": [{"text": "second"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 7,
+                    "candidatesTokenCount": 3,
+                    "totalTokenCount": 10,
+                },
+            },
+        ]
+        with mock.patch.object(providers.http, "post", side_effect=responses):
+            self.assertEqual("first", client.generate_text("model", "prompt"))
+            self.assertEqual("second", client.generate_text("model", "prompt"))
+        self.assertEqual(
+            {"calls": 2, "promptTokens": 17, "completionTokens": 13, "totalTokens": 30},
+            client.total_usage,
+        )
+
+    def test_non_gemini_providers_capture_response_usage(self):
+        cases = [
+            (providers.OpenAIClient("dummy"), {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}),
+            (providers.XAIClient("dummy"), {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}),
+            (providers.OpenRouterClient("dummy"), {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}),
+        ]
+        for client, usage in cases:
+            with self.subTest(provider=client.name):
+                with mock.patch.object(providers.http, "post", return_value={"output_text": "ok", "usage": usage}):
+                    self.assertEqual("ok", client.generate_text("model", "prompt"))
+                self.assertEqual(
+                    {"calls": 1, "promptTokens": 11, "completionTokens": 7, "totalTokens": 18},
+                    client.total_usage,
+                )
+
+    def test_missing_usage_never_exports_a_partial_or_false_zero_total(self):
+        client = providers.OpenAIClient("dummy")
+        responses = [
+            {"output_text": "first", "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}},
+            {"output_text": "second"},
+        ]
+        with mock.patch.object(providers.http, "post", side_effect=responses):
+            client.generate_text("model", "prompt")
+            client.generate_text("model", "prompt")
+        self.assertIsNone(client.total_usage)
+
+    def test_missing_usage_is_null_for_each_provider(self):
+        clients_and_responses = [
+            (providers.GeminiClient("dummy"), {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+            (providers.OpenAIClient("dummy"), {"output_text": "ok"}),
+            (providers.XAIClient("dummy"), {"output_text": "ok"}),
+            (providers.OpenRouterClient("dummy"), {"output_text": "ok"}),
+        ]
+        for client, response in clients_and_responses:
+            with self.subTest(provider=client.name):
+                with mock.patch.object(providers.http, "post", return_value=response):
+                    self.assertEqual("ok", client.generate_text("model", "prompt"))
+                self.assertIsNone(client.total_usage)
+
+    def test_reported_zero_usage_is_not_treated_as_missing(self):
+        client = providers.OpenRouterClient("dummy")
+        response = {
+            "output_text": "cached",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+        with mock.patch.object(providers.http, "post", return_value=response):
+            self.assertEqual("cached", client.generate_text("model", "prompt"))
+        self.assertEqual(
+            {"calls": 1, "promptTokens": 0, "completionTokens": 0, "totalTokens": 0},
+            client.total_usage,
+        )
+
+    def test_xai_reported_total_includes_reasoning_tokens(self):
+        client = providers.XAIClient("dummy")
+        response = {
+            "output_text": "ok",
+            "usage": {"prompt_tokens": 32, "completion_tokens": 9, "total_tokens": 151},
+        }
+        with mock.patch.object(providers.http, "post", return_value=response):
+            client.generate_text("model", "prompt")
+        self.assertEqual(
+            {"calls": 1, "promptTokens": 32, "completionTokens": 119, "totalTokens": 151},
+            client.total_usage,
+        )
+
+    def test_xai_responses_usage_uses_input_and_output_token_keys(self):
+        client = providers.XAIClient("dummy")
+        response = {
+            "output_text": "ok",
+            "usage": {"input_tokens": 131, "output_tokens": 624, "total_tokens": 755},
+        }
+        with mock.patch.object(providers.http, "post", return_value=response):
+            client.generate_text("model", "prompt")
+        self.assertEqual(
+            {"calls": 1, "promptTokens": 131, "completionTokens": 624, "totalTokens": 755},
+            client.total_usage,
+        )
+
+    def test_inconsistent_provider_total_is_unavailable(self):
+        client = providers.OpenRouterClient("dummy")
+        response = {
+            "output_text": "ok",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 12},
+        }
+        with mock.patch.object(providers.http, "post", return_value=response):
+            client.generate_text("model", "prompt")
+        self.assertIsNone(client.total_usage)
+
+    def test_stale_non_gemini_pin_falls_back_to_default_on_gemini(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            runtime = providers.mock_runtime(
+                {"LAST30DAYS_PLANNER_MODEL": "grok-4.20-0309-non-reasoning"},
+                depth="default",
+            )
+        self.assertEqual(providers.GEMINI_FLASH_LITE, runtime.planner_model)
+        self.assertEqual(providers.GEMINI_FLASH_LITE, runtime.rerank_model)
+        self.assertIn("grok-4.20-0309-non-reasoning", stderr.getvalue())
+        self.assertIn(f"using {providers.GEMINI_FLASH_LITE}", stderr.getvalue())
+
+    def test_stale_rerank_pin_falls_back_to_default_on_gemini(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            runtime = providers.mock_runtime(
+                {"LAST30DAYS_RERANK_MODEL": "gemini-2.5-flash"},
+                depth="default",
+            )
+        self.assertEqual(providers.GEMINI_FLASH_LITE, runtime.rerank_model)
+        self.assertIn("gemini-2.5-flash", stderr.getvalue())
+        self.assertIn(f"using {providers.GEMINI_FLASH_LITE}", stderr.getvalue())
+
+    def test_newer_gemini_pins_are_accepted(self):
+        for model in ("gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-4-hydrogen", "gemini-10-pro"):
+            runtime = providers.mock_runtime(
+                {"LAST30DAYS_PLANNER_MODEL": model, "LAST30DAYS_RERANK_MODEL": model},
+                depth="default",
+            )
+            self.assertEqual(model, runtime.planner_model)
+            self.assertEqual(model, runtime.rerank_model)

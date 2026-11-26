@@ -6,10 +6,17 @@ from lib import dedupe
 from lib.schema import SourceItem
 
 
-def _item(title: str, body: str = "", source: str = "reddit", item_id: str = "t1") -> SourceItem:
+def _item(
+    title: str,
+    body: str = "",
+    source: str = "reddit",
+    item_id: str = "t1",
+    url: str | None = None,
+) -> SourceItem:
     return SourceItem(
         item_id=item_id, source=source, title=title, body=body,
-        url="https://example.com", engagement={}, metadata={},
+        url=f"https://example.com/{item_id}" if url is None else url,
+        engagement={}, metadata={},
     )
 
 # ---------------------------------------------------------------------------
@@ -96,10 +103,10 @@ class TestTokenJaccard(unittest.TestCase):
         self.assertAlmostEqual(result, 1.0 / 3.0)  # {big} / {big, cat, dog}
 
     def test_filters_single_char_tokens(self):
-        # Single char tokens like "I" are filtered (len > 1)
-        result = dedupe.token_jaccard("I am great", "I am terrible")
-        # "am" is len 2, "great"/"terrible" are content
-        self.assertGreater(result, 0.0)
+        self.assertAlmostEqual(
+            dedupe.token_jaccard("x shared alpha", "x shared beta"), 1.0 / 3.0
+        )
+        self.assertEqual(dedupe.token_jaccard("x alpha", "x beta"), 0.0)
 
 # ---------------------------------------------------------------------------
 # hybrid_similarity
@@ -210,3 +217,40 @@ class TestDedupeItems(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPolymarketMatchedEvents(unittest.TestCase):
+
+    @staticmethod
+    def _market(event_id, title, question, matched=True):
+        metadata = {"event_id": event_id}
+        if matched:
+            metadata["matched_market"] = {"label": "San Francisco 49ers", "question": question}
+        return SourceItem(
+            item_id=event_id, source="polymarket", title=title,
+            body=f"{title}\n{question}", url=f"https://polymarket.com/event/{event_id}",
+            container="Polymarket", engagement={}, metadata=metadata,
+        )
+
+    def _champions(self, matched=True):
+        return [
+            self._market("1", "Pro Football: 2027 Champion",
+                         "Will the San Francisco 49ers win the 2027 NFL championship?", matched),
+            self._market("2", "Pro Football: 2027 NFC Champion",
+                         "Will the San Francisco 49ers win the 2027 NFC championship?", matched),
+        ]
+
+    def test_distinct_matched_events_are_both_kept(self):
+        items = self._champions()
+        self.assertGreaterEqual(
+            dedupe.hybrid_similarity(dedupe.item_text(items[0]), dedupe.item_text(items[1])), 0.7,
+        )
+        self.assertEqual([item.item_id for item in dedupe.dedupe_items(items)], ["1", "2"])
+
+    def test_the_same_matched_event_twice_is_kept_once(self):
+        first, _second = self._champions()
+        again = self._market("1", first.title, "Will the San Francisco 49ers win?")
+        self.assertEqual([item.item_id for item in dedupe.dedupe_items([first, again])], ["1"])
+
+    def test_unmatched_polymarket_items_still_dedupe_by_text(self):
+        self.assertEqual(len(dedupe.dedupe_items(self._champions(matched=False))), 1)

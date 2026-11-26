@@ -13,11 +13,10 @@ config, depth, and overrides for each entity.
 
 from __future__ import annotations
 
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
-from . import schema
+from . import fetch_memo, http, log, schema, youtube_yt
 
 # Sub-runs hit the same upstream APIs as the main topic. Cap parallelism so a
 # 6-way fan-out does not stampede a single backend's rate limit.
@@ -25,7 +24,7 @@ MAX_PARALLEL_SUBRUNS = 6
 
 
 def _log(msg: str) -> None:
-    print(f"[Fanout] {msg}", file=sys.stderr)
+    log.source_log("Fanout", msg, tty_only=False)
 
 
 def run_competitor_fanout(
@@ -47,10 +46,21 @@ def run_competitor_fanout(
         Ordered list of (entity_name, Report) tuples for runs that succeeded.
         Empty list if every run raised; the caller decides how to surface
         partial-failure modes.
+
+        ``main_topic`` is NOT guaranteed to be present: a main run that raised
+        is dropped like any other. Since the render treats element 0 as the
+        comparison's subject, a caller must verify ``main_topic`` survived
+        before using the list, or it will silently head the report with a
+        competitor.
     """
     if not competitors:
         report = main_runner()
         return [(main_topic, report)]
+
+    # One isolated fetch_memo scope for the whole comparison so entity sub-runs
+    # share in-run hits without inheriting a prior run's results or wiping a
+    # concurrent run's active fetches in this process.
+    youtube_yt.reset_search_cache()
 
     workers = min(len(competitors) + 1, MAX_PARALLEL_SUBRUNS)
 
@@ -66,9 +76,9 @@ def run_competitor_fanout(
     for entity in competitors:
         submissions.append((entity, lambda e=entity: competitor_runner(e)))
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    with fetch_memo.run_scope(), ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_run_one, label, fn): label
+            http.submit_with_context(executor, _run_one, label, fn): label
             for label, fn in submissions
         }
         results: dict[str, schema.Report] = {}

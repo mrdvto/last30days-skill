@@ -4,21 +4,33 @@ This guide covers installing last30days on Hermes AI Agent.
 
 ## Prerequisites
 
-1. **Hermes installed** - See https://github.com/mercurial-tf/hermes
+1. **Hermes installed** - See https://github.com/NousResearch/hermes-agent
 2. **Python 3.12+** - `brew install python@3.12` or similar
 3. **yt-dlp** (optional, for YouTube) - `brew install yt-dlp`
 
 ## Installation
 
 ```bash
-hermes skills install mvanhorn/last30days-skill --force
+hermes skills install mvanhorn/last30days-skill/skills/last30days --force
 ```
 
-This pulls the latest release from GitHub and deploys to `~/.hermes/skills/research/last30days/`. `--force` reinstalls over any existing copy.
+Hermes's install-time scanner rates this skill `caution`, not `dangerous`: it flags ordinary things a research tool does, such as reading its own config from environment variables and running `yt-dlp` with `subprocess`. Hermes blocks a `caution` community skill unless you pass `--force`. Run `hermes skills list` to confirm it shows up. A session that is already open needs `/reload-skills` (or a new session) to pick it up.
+
+Use the full `owner/repo/skills/last30days` path shown above. Do not install from a raw `SKILL.md` URL: that route copies only the files `SKILL.md` names directly and leaves out most of `scripts/lib/`, so research runs fail. The shorter `hermes skills install mvanhorn/last30days-skill` goes through the skills.sh index, which has served stale snapshots of this repo before ([vercel-labs/skills#1602](https://github.com/vercel-labs/skills/issues/1602)).
+
+If the install is ever blocked again (`dangerous` verdict, "--force does not override a dangerous verdict"), please open an issue with the scan output, and copy the skill in by hand meanwhile:
+
+```bash
+git clone https://github.com/mvanhorn/last30days-skill.git
+mkdir -p ~/.hermes/skills/research
+cp -r last30days-skill/skills/last30days ~/.hermes/skills/research/
+```
+
+That deploys the skill straight from this repo's default branch to `~/.hermes/skills/research/last30days` (with named profiles the skills root is `~/.hermes/profiles/<name>/skills/`).
 
 ### Developer / live-edit alternative
 
-If you're hacking on the skill locally and want edits to propagate to Hermes without re-installing, symlink your working tree:
+If you're hacking on the skill locally and want edits to propagate to Hermes without re-copying, symlink your working tree instead of `cp`:
 
 ```bash
 git clone https://github.com/mvanhorn/last30days-skill.git
@@ -47,6 +59,7 @@ On first run, the skill will guide you through setup:
 1. **Auto setup** (~30 seconds)
    - Scans browser cookies for X/Twitter
    - Checks/installs yt-dlp for YouTube
+   - Best-effort install of `digg-pp-cli` for Digg story clusters (via `@mvanhorn/printing-press-library`; binary lands in `$HOME/.local/bin` — ensure your Hermes gateway PATH includes it, or Digg stays off even after install)
    - Configures free sources (Reddit, HN, Polymarket)
 
 2. **Optional: ScrapeCreators**
@@ -65,6 +78,7 @@ On first run, the skill will guide you through setup:
 - **Hacker News** - Tech discussions via Algolia
 - **Polymarket** - Prediction markets
 - **YouTube** - Search and transcripts (requires yt-dlp)
+- **Digg** - story clusters from every Digg topic, ranked by Digg Score (requires `digg-pp-cli` on the agent PATH; auto-installed to `$HOME/.local/bin` during setup when `npx` is available)
 
 ### Requires API Key
 - **X/Twitter** - xAI API key or browser cookies
@@ -98,14 +112,23 @@ python3.12 scripts/last30days.py --diagnose
 
 ## Updating
 
+Re-run the install command. `--force` replaces the installed copy with the current version:
+
 ```bash
-hermes skills install mvanhorn/last30days-skill --force
+hermes skills install mvanhorn/last30days-skill/skills/last30days --force
 ```
 
-If you symlinked your working tree (developer alternative above), just `git pull` in the repo — edits propagate live, no re-install step.
+`hermes skills update last30days` reports "No updates available" for a copy that was put in by hand (`git clone` + `cp`), and it reinstalls without `--force`, so Hermes blocks the `caution` verdict. Use the install command instead. If an older copy was put in by hand, remove that folder first (for example `~/.hermes/skills/research/last30days`). To keep copying by hand instead:
+
+```bash
+cd last30days-skill && git pull
+cp -r skills/last30days ~/.hermes/skills/research/
+```
+
+If you symlinked your working tree (developer alternative above), just `git pull` in the repo; edits propagate live.
 
 ## Support
 
 - Original repo: https://github.com/mvanhorn/last30days-skill
-- Hermes: https://github.com/mercurial-tf/hermes
+- Hermes: https://github.com/NousResearch/hermes-agent
 - Issues: Please report in the original repo

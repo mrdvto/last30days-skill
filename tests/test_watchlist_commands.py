@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+import last30days as cli
 import store
 import watchlist
 from lib import schema
@@ -16,20 +17,19 @@ from lib import schema
 @pytest.fixture
 
 
-def temp_db():
+def temp_db(tmp_path):
     """Create a temporary database for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = Path(f.name)
-    
+    db_path = tmp_path / "test_watchlist.db"
+
     # Override the database path
     original_override = store._db_override
     store._db_override = db_path
-    
+
     # Initialize fresh database
     store.init_db()
-    
+
     yield db_path
-    
+
     # Cleanup
     store._db_override = original_override
     if db_path.exists():
@@ -250,6 +250,21 @@ def test_cmd_config_delivery(temp_db, capsys):
     
     assert output["action"] == "config"
     assert output["key"] == "delivery_channel"
+    assert output["configured"] is True
+    assert args.value not in captured.out
+
+
+def test_cmd_config_delivery_rejects_non_https(temp_db):
+    """A non-https delivery channel is rejected at write time, not stored."""
+    args = Mock()
+    args.key = "delivery"
+    args.value = "http://evil.example/hooks.slack.com"
+
+    with pytest.raises(SystemExit) as failure:
+        watchlist.cmd_config(args)
+
+    assert args.value not in str(failure.value)
+    assert not store.get_setting("delivery_channel")
 
 
 def test_cmd_config_budget(temp_db, capsys):
@@ -275,6 +290,39 @@ def test_cmd_config_unknown_key(temp_db):
         watchlist.cmd_config(args)
 
 # === Tests for _run_topic() ===
+
+@pytest.mark.parametrize(
+    ("name", "queries"),
+    [
+        pytest.param("search trends", None, id="ordinary"),
+        pytest.param("setup", None, id="reserved"),
+        pytest.param("option names", ["--quick"], id="option-shaped-query"),
+    ],
+)
+def test_run_topic_passes_literal_research_topic(temp_db, name, queries):
+    topic = store.add_topic(name, search_queries=queries)
+    expected_topic = queries[0] if queries else name
+    with patch(
+        "watchlist.subprocess.run",
+        autospec=True,
+        return_value=subprocess.CompletedProcess([], 1, "", "offline"),
+    ) as run:
+        watchlist._run_topic(topic)
+
+    run.assert_called_once()
+    argv = run.call_args.args[0]
+    parsed, extra = cli.build_parser().parse_known_args(argv[2:])
+    assert parsed.topic == [expected_topic]
+    assert parsed.research_only is True
+    assert argv[-2:] == ["--", expected_topic]
+    assert not extra
+    assert parsed.emit == "json"
+    assert parsed.json_profile == "raw"
+    assert parsed.quick is True
+    assert parsed.lookback_days == 90
+    assert parsed.no_browser_cookies is True
+    assert run.call_args.kwargs["env"]["LAST30DAYS_STORE"] == "0"
+
 
 @patch('watchlist.subprocess.run')
 
@@ -362,6 +410,9 @@ def test_run_topic_success(mock_subprocess, temp_db):
     assert result["status"] == "completed"
     assert result["new"] == 1
     assert result["topic"] == "Test Topic"
+    argv = mock_subprocess.call_args.args[0]
+    assert "--emit=json" in argv
+    assert "--json-profile=raw" in argv
 
 @patch('watchlist.subprocess.run')
 
@@ -570,18 +621,14 @@ def test_cmd_run_all_multiple_topics(mock_run, temp_db, capsys):
     assert len(output["results"]) == 2
 
 @patch('watchlist._run_topic')
-@patch('watchlist.store.get_daily_cost')
-
-
-def test_cmd_run_all_respects_budget(mock_cost, mock_run, temp_db, capsys):
+def test_cmd_run_all_respects_budget(mock_run, temp_db, capsys):
     """Test that run-all respects daily budget."""
     # Add topics
-    store.add_topic("Topic 1")
+    first = store.add_topic("Topic 1")
     store.add_topic("Topic 2")
     store.add_topic("Topic 3")
     
-    # Mock budget exceeded (budget limit is 5.0)
-    mock_cost.return_value = 6.0  # Over budget
+    store.record_run(first["id"], token_cost=6.0)
     
     mock_run.return_value = {
         "topic": "Test",
@@ -604,6 +651,7 @@ def test_cmd_run_all_respects_budget(mock_cost, mock_run, temp_db, capsys):
     skipped = [r for r in results if r["status"] == "skipped"]
     
     assert len(skipped) == 3  # All 3 topics skipped
+    mock_run.assert_not_called()
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

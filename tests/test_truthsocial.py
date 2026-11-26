@@ -25,8 +25,32 @@ class TestStripHtml(unittest.TestCase):
     def test_no_tags(self):
         self.assertEqual(truthsocial._strip_html("plain text"), "plain text")
 
-    def test_entities_preserved(self):
-        self.assertEqual(truthsocial._strip_html("<p>&amp; test</p>"), "&amp; test")
+    def test_entities_unescaped(self):
+        self.assertEqual(truthsocial._strip_html("<p>&amp; test</p>"), "& test")
+        self.assertEqual(
+            truthsocial._strip_html(
+                "<p>We&#39;re &quot;winning&quot; on tariffs &amp; trade &gt; anyone thought</p>"
+            ),
+            'We\'re "winning" on tariffs & trade > anyone thought',
+        )
+
+    def test_escaped_markup_is_kept_as_text(self):
+        # Entities are decoded after tags are stripped, so an escaped tag in
+        # the post text survives as text instead of being removed.
+        self.assertEqual(
+            truthsocial._strip_html("<p>use &lt;b&gt; for bold</p>"),
+            "use <b> for bold",
+        )
+
+    def test_paragraphs_are_separated(self):
+        self.assertEqual(
+            truthsocial._strip_html("<p>First paragraph.</p><p>Second paragraph.</p>"),
+            "First paragraph.\nSecond paragraph.",
+        )
+        self.assertEqual(
+            truthsocial._strip_html('<p>One</p>\n<p class="x">Two</p>'),
+            "One\nTwo",
+        )
 
 
 class TestExtractCoreSubject(unittest.TestCase):
@@ -89,6 +113,25 @@ class TestSearchTruthSocial(unittest.TestCase):
         )
         self.assertEqual(result["statuses"], [])
         self.assertIn("not configured", result["error"])
+
+    @patch("lib.truthsocial.http.request")
+    def test_search_sends_browser_like_headers(self, mock_request):
+        """Regression for #909: Cloudflare 403s the skill's default
+        User-Agent regardless of token validity; the request must include
+        browser-like headers alongside Authorization."""
+        from lib import http as http_module
+        mock_request.return_value = {"statuses": []}
+        truthsocial.search_truthsocial(
+            "health policy", "2026-02-09", "2026-03-09",
+            config={"TRUTHSOCIAL_TOKEN": "valid_token"},
+        )
+        _, kwargs = mock_request.call_args
+        headers = kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer valid_token")
+        self.assertEqual(headers["User-Agent"], http_module.BROWSER_USER_AGENT)
+        self.assertIn("Accept", headers)
+        self.assertIn("Accept-Language", headers)
+        self.assertEqual(headers["Referer"], "https://truthsocial.com/")
 
     @patch("lib.truthsocial.http.request")
     def test_401_returns_token_expired(self, mock_request):
@@ -224,6 +267,18 @@ class TestParseTruthSocialResponse(unittest.TestCase):
         items = truthsocial.parse_truthsocial_response(response)
         self.assertNotIn("<", items[0]["text"])
         self.assertNotIn(">", items[0]["text"])
+
+    def test_parse_decodes_entities_and_paragraphs(self):
+        response = {
+            "statuses": [
+                {
+                    "content": "<p>Tariffs &amp; trade</p><p>It&#39;s &quot;huge&quot;</p>",
+                    "account": {"acct": "poster"},
+                }
+            ]
+        }
+        items = truthsocial.parse_truthsocial_response(response)
+        self.assertEqual(items[0]["text"], 'Tariffs & trade\nIt\'s "huge"')
 
 if __name__ == "__main__":
     unittest.main()

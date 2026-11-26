@@ -107,7 +107,8 @@ class HtmlRenderSnapshotTests(unittest.TestCase):
         snapshot_markers = [
             "<!DOCTYPE html>",
             "<title>last30days · AI agent frameworks</title>",
-            '<div class="badge"><span class="accent">🌐</span> last30days v',
+            '<div class="badge"><span class="accent">🌐</span> '
+            "last30days · AI agent frameworks · Mar 30 to Apr 29, 2026 · v",
             '<div class="meta">2026-03-30 to 2026-04-29',
             '<div class="engine-footer"><pre>---\n✅ All agents reported back!',
             'Generated 2026-04-29 by /last30days v',
@@ -151,6 +152,98 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
         self.assertIn("<h2>What I learned</h2>", rendered)
         self.assertNotIn("What I learned:", rendered)
 
+    def test_claude_code_list_free_markers_render_as_lists(self):
+        # On Claude Code the chat report writes `1\.` and `• ` instead of
+        # markdown lists; the export copies that text verbatim.
+        md = "KEY PATTERNS:\n1\\. First, per [CNN](https://example.test/a)\n2\\. Second\n\nAsk me:\n• Go deeper\n• Compare"
+        rendered = html_render._markdown_to_html(md)
+        self.assertIn("<ol>\n<li>First, per", rendered)
+        self.assertIn("<li>Second</li>\n</ol>", rendered)
+        self.assertIn("<ul>\n<li>Go deeper</li>\n<li>Compare</li>\n</ul>", rendered)
+        self.assertNotIn("\\.", rendered)
+        self.assertNotIn("•", rendered)
+
+    def test_hard_break_backslashes_from_the_terminal_report_are_dropped(self):
+        # In the Claude Code terminal each pseudo-list line but the last ends in
+        # a `\\` hard break; the export keeps the lists and drops the backslash.
+        md = (
+            "KEY PATTERNS from the research:\\\n"
+            "1\\. First, per [r/x](https://reddit.com/r/x)\\\n"
+            "2\\. Second\n\n"
+            "Some things I can help with:\\\n"
+            "• Go deeper\\\n"
+            "• Compare"
+        )
+        rendered = html_render._markdown_to_html(md)
+        self.assertIn("<p>KEY PATTERNS from the research:</p>", rendered)
+        self.assertIn('<li>First, per <a href="https://reddit.com/r/x"', rendered)
+        self.assertIn("<li>Second</li>\n</ol>", rendered)
+        self.assertIn("<ul>\n<li>Go deeper</li>\n<li>Compare</li>\n</ul>", rendered)
+        self.assertNotIn("\\", rendered)
+
+    def test_terminal_patterns_label_with_a_hard_break_still_becomes_a_heading(self):
+        synthesis = (
+            "What I learned:\\\n"
+            "Teams ship agents.\n\n"
+            "KEY PATTERNS from the research:\\\n"
+            "1\\. First\\\n"
+            "2\\. Second"
+        )
+        rendered = html_render.render_html(
+            _report("AI agent frameworks", ["One"]), synthesis_md=synthesis
+        )
+        self.assertIn("Key patterns from the research</h2>", rendered)
+        self.assertIn("What I learned</h2>", rendered)
+        self.assertNotIn("KEY PATTERNS from the research:", rendered)
+
+    def test_an_escaped_trailing_backslash_is_kept(self):
+        rendered = html_render._markdown_to_html("Path is C:\\\\")
+        self.assertIn("\\", rendered)
+
+    def test_each_story_keeps_its_own_pulled_quote(self):
+        md = (
+            "**North West takes the stage** - Fans say she sounds like her father.\n"
+            '> "Ofc shes literally him😭" 🎵 @haktimel2 on TikTok · 825,451 likes\n'
+            "\n"
+            "**The album debate** - Reddit is less convinced.\n"
+            "\n"
+            '> "Internet feelings vs reality." 🟠 u/CappaccinoJay on r/hiphopheads · 1,315 upvotes\n'
+        )
+        rendered = html_render._markdown_to_html(md)
+        self.assertEqual(2, rendered.count("<blockquote>"))
+        self.assertIn(
+            "<blockquote>&quot;Ofc shes literally him😭&quot; 🎵 @haktimel2 on TikTok · 825,451 likes</blockquote>",
+            rendered,
+        )
+        self.assertIn(
+            "<blockquote>&quot;Internet feelings vs reality.&quot; 🟠 u/CappaccinoJay"
+            " on r/hiphopheads · 1,315 upvotes</blockquote>",
+            rendered,
+        )
+        first_quote = rendered.index("<blockquote>")
+        self.assertLess(rendered.index("North West takes the stage"), first_quote)
+        self.assertLess(first_quote, rendered.index("The album debate"))
+        self.assertLess(rendered.index("The album debate"), rendered.rindex("<blockquote>"))
+
+    def test_pulled_quote_text_renders_literally(self):
+        md = (
+            '> "a > b, 5 * 4 | see https://example.test/x?a=1&b=2 <script>" '
+            "🟠 u/ada on r/math · 12 upvotes"
+        )
+        rendered = html_render._markdown_to_html(md)
+        self.assertEqual(
+            "<blockquote>&quot;a &gt; b, 5 * 4 | see https://example.test/x?a=1&amp;b=2"
+            " &lt;script&gt;&quot; 🟠 u/ada on r/math · 12 upvotes</blockquote>",
+            rendered.strip(),
+        )
+        for tag in ("<a ", "<em>", "<table", "<script>"):
+            self.assertNotIn(tag, rendered)
+
+    def test_list_free_markers_inside_code_are_left_alone(self):
+        rendered = html_render._markdown_to_html("```\n• keep\n1\\. keep\n```")
+        self.assertIn("• keep", rendered)
+        self.assertIn("1\\. keep", rendered)
+
     def test_invitation_strip(self):
         md = "---\nI'm now an expert on OpenClaw. Some things you could ask:\n\nJust ask."
         self.assertNotIn("I'm now an expert", html_render._strip_invitation(md))
@@ -175,6 +268,36 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
         self.assertIn("├─ 🔵 X: 2 posts", body)
         self.assertIn("└─ 🌐 Web: 1 result", body)
 
+    def test_fenced_engine_footer_wrapping_preserves_tree(self):
+        md = (
+            "```text\n"
+            "---\n"
+            "✅ All agents reported back!\n"
+            "├─ 🔵 X: 2 posts\n"
+            "└─ 🌐 Web: 1 result\n"
+            "---\n"
+            "```"
+        )
+        body = html_render._wrap_engine_footer(html_render._markdown_to_html(md))
+        self.assertIn('<div class="engine-footer"><pre>---\n✅ All agents reported back!', body)
+        self.assertIn("├─ 🔵 X: 2 posts", body)
+        self.assertIn("└─ 🌐 Web: 1 result", body)
+
+    def test_fenced_footer_match_does_not_swallow_an_earlier_text_block(self):
+        md = (
+            "```text\n---\nquoted by the synthesis\n---\n```\n\n"
+            "Prose between the blocks.\n\n"
+            "```text\n---\n✅ All agents reported back!\n└─ 🌐 Web: 1 result\n---\n```"
+        )
+        matches = list(html_render.FENCED_ENGINE_FOOTER_PATTERN.finditer(md))
+        self.assertEqual(len(matches), 1)
+        self.assertNotIn("Prose between the blocks.", matches[0].group(0))
+        self.assertNotIn("quoted by the synthesis", matches[0].group(0))
+
+        protected, footers = html_render._protect_engine_footers(md)
+        self.assertIn("Prose between the blocks.", protected)
+        self.assertEqual(len(footers), 1)
+
     def test_colophon_contains_topic_and_rerun_command(self):
         rendered = html_render.render_html(_report("AI agent frameworks", []))
         self.assertIn("topic: AI agent frameworks", rendered)
@@ -186,11 +309,106 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
     def test_self_containedness(self):
         rendered = html_render.render_html(_report("self contained", []))
         self.assertNotIn("<script", rendered.lower())
-        self.assertEqual(1, rendered.count('rel="stylesheet"'))
+        self.assertEqual(0, rendered.count('rel="stylesheet"'))
+        self.assertNotIn("fonts.googleapis.com", rendered)
+        self.assertNotIn("fonts.gstatic.com", rendered)
+        self.assertNotIn('rel="preconnect"', rendered)
 
     def test_markdown_links_convert(self):
         rendered = html_render._markdown_to_html("[name](https://example.test/path)")
-        self.assertIn('<a href="https://example.test/path">name</a>', rendered)
+        self.assertIn(
+            '<a href="https://example.test/path" rel="noopener noreferrer">name</a>',
+            rendered,
+        )
+
+    def test_markdown_links_reject_javascript_scheme(self):
+        """A `[label](javascript:...)` link must NOT render as a clickable href.
+
+        The HTML artifact is opened in a browser, so allowing arbitrary URL
+        schemes turns synthesized markdown into a stored-XSS surface. External
+        sources (Reddit, X, HN, etc.) can plant such links and the LLM may
+        carry them through synthesis; the renderer is the last gate.
+        """
+        for payload in (
+            "[click](javascript:alert(1))",
+            "[click](JAVASCRIPT:alert(1))",
+            "[click](vbscript:alert(1))",
+            "[click](file:///etc/passwd)",
+        ):
+            rendered = html_render._markdown_to_html(payload)
+            self.assertNotIn("<a ", rendered, msg=f"payload accepted: {payload}")
+            self.assertNotIn("href=", rendered, msg=f"payload accepted: {payload}")
+            # The label still surfaces as plain text so context isn't lost.
+            self.assertIn("click", rendered, msg=f"label dropped: {payload}")
+
+    def test_markdown_links_reject_data_uri(self):
+        rendered = html_render._markdown_to_html(
+            "[click](data:text/html,<svg/onload=alert(1)>)"
+        )
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("href=", rendered)
+        # The label still surfaces as plain text so context isn't lost.
+        self.assertIn("click", rendered)
+
+    def test_markdown_links_strip_leading_whitespace_javascript(self):
+        """Leading whitespace in the URL must not let a `javascript:` payload
+        bypass the scheme check (browsers strip leading whitespace before
+        parsing the scheme)."""
+        rendered = html_render._markdown_to_html("[click](\tjavascript:alert(1))")
+        # `[^)\\s]+` already rejects whitespace inside the URL, so the regex
+        # doesn't match and the label is left as plain text. The point of the
+        # assertion is to pin that behavior: NO `<a href>` is produced.
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("href=", rendered)
+
+    def test_meta_marker_escapes_payload_through_pipeline(self):
+        """A META marker carrying markup must not render as live HTML.
+
+        The marker is exempted from the comment-strip pass and promoted into a
+        <div class="meta">. Its text can come from LLM-synthesized content
+        derived from untrusted source bodies, so a crafted
+        `<!-- META: <img src=x onerror=...> -->` must be escaped, not rendered.
+        """
+        md = "intro\n\n<!-- META: <img src=x onerror=alert(1)> -->\n\nmore"
+        body = html_render._markdown_to_html(md)
+        body = html_render._wrap_engine_footer(body)
+        body = html_render._promote_meta_marker(body)
+        self.assertNotIn("<img", body)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", body)
+
+    def test_meta_marker_escapes_raw_fallback(self):
+        """The raw (unescaped) META fallback path must also escape its payload."""
+        body = html_render._promote_meta_marker(
+            "<!-- META: <img src=x onerror=alert(1)> -->"
+        )
+        self.assertNotIn("<img", body)
+        self.assertEqual(
+            body, '<div class="meta">&lt;img src=x onerror=alert(1)&gt;</div>'
+        )
+
+    def test_meta_marker_preserves_plain_text(self):
+        """Legitimate date/source-name markers render unchanged (no double-escape)."""
+        body = html_render._promote_meta_marker(
+            "<!-- META: 2026-01-01 to 2026-01-31 · reddit, x -->"
+        )
+        self.assertEqual(
+            body,
+            '<div class="meta">2026-01-01 to 2026-01-31 · reddit, x</div>',
+        )
+
+    def test_markdown_links_allow_relative_url(self):
+        rendered = html_render._markdown_to_html("[home](/path?x=1#section)")
+        self.assertIn(
+            '<a href="/path?x=1#section" rel="noopener noreferrer">home</a>',
+            rendered,
+        )
+
+    def test_markdown_links_allow_mailto(self):
+        rendered = html_render._markdown_to_html("[mail](mailto:a@example.com)")
+        self.assertIn(
+            '<a href="mailto:a@example.com" rel="noopener noreferrer">mail</a>',
+            rendered,
+        )
 
     def test_no_file_header_h1(self):
         rendered = html_render.render_html(_report("AI agent frameworks", ["One"]))
@@ -207,7 +425,10 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
             synthesis_md=synthesis,
         )
         self.assertIn("<strong>Test brief</strong> - body content per", rendered)
-        self.assertIn('<a href="https://example.com">@example</a>', rendered)
+        self.assertIn(
+            '<a href="https://example.com" rel="noopener noreferrer">@example</a>',
+            rendered,
+        )
         metadata_index = rendered.index('<div class="meta">')
         synthesis_index = rendered.index("<strong>Test brief</strong>")
         footer_index = rendered.index('<div class="engine-footer">')
@@ -234,6 +455,102 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
         self.assertNotIn("Pre-Research Status", rendered)
         # No blockquote at all in mock output - just badge + meta + footer + colophon
         self.assertEqual(0, rendered.count("<blockquote>"))
+
+
+SUGGESTIONS = (
+    "- What is the real story behind the apology letter?\n"
+    "- Break down the BULLY tracklist reactions\n"
+    "- Compare how Reddit and X are reacting"
+)
+EXPERT_INVITATIONS = {
+    "prompting": (
+        "---\nI'm now an expert on product photos for Midjourney. What do you want to make? For example:\n"
+        f"{SUGGESTIONS}\n\n"
+        "Just describe your vision and I'll write a prompt you can paste straight into Midjourney."
+    ),
+    "recommendations": f"---\nI'm now an expert on kids skis. Want me to go deeper? For example:\n{SUGGESTIONS}",
+    "news": f"---\nI'm now an expert on Kanye West. Some things you could ask:\n{SUGGESTIONS}",
+    "general": f"---\nI'm now an expert on Kanye West. Some things I can help with:\n{SUGGESTIONS}",
+}
+COMPARISON_INVITATION = (
+    "I've compared Cursor vs Windsurf using the latest community data. Some things you could ask:\n"
+    f"{SUGGESTIONS}"
+)
+OLD_LINK_LINE = (
+    "\n\nI have all the links to the 14 Reddit threads, 22 X posts, and 5 web articles I pulled from. Just ask."
+)
+REPORT_BODY = (
+    "What I learned:\n\n"
+    "**The apology letter** - fans are split, per [@example](https://example.com)\n\n"
+    "---\n\n"
+    "KEY PATTERNS from the research:\n"
+    "1. Closing pattern stays in the brief\n\n"
+)
+
+
+class InvitationStripTests(unittest.TestCase):
+    def test_old_reports_lose_each_expert_invitation(self):
+        for name, invitation in EXPERT_INVITATIONS.items():
+            with self.subTest(shape=name):
+                stripped = html_render._strip_invitation(REPORT_BODY + invitation + OLD_LINK_LINE)
+                self.assertNotIn("I'm now an expert", stripped)
+                self.assertNotIn("apology letter?", stripped)
+                self.assertNotIn("Just ask.", stripped)
+                self.assertIn("Closing pattern stays in the brief", stripped)
+
+    def test_old_comparison_report_loses_its_invitation(self):
+        stripped = html_render._strip_invitation(REPORT_BODY + COMPARISON_INVITATION + OLD_LINK_LINE)
+        self.assertNotIn("I've compared Cursor vs Windsurf", stripped)
+        self.assertNotIn("Just ask.", stripped)
+        self.assertIn("Closing pattern stays in the brief", stripped)
+
+    def test_reports_ending_at_the_invitation_lose_each_shape(self):
+        shapes = {**EXPERT_INVITATIONS, "comparison": COMPARISON_INVITATION}
+        for name, invitation in shapes.items():
+            with self.subTest(shape=name):
+                stripped = html_render._strip_invitation(REPORT_BODY + invitation + "\n")
+                self.assertNotIn("I'm now an expert", stripped)
+                self.assertNotIn("I've compared", stripped)
+                self.assertNotIn("apology letter?", stripped)
+                self.assertNotIn("Just describe your vision", stripped)
+                self.assertIn("Closing pattern stays in the brief", stripped)
+
+    def test_body_rule_before_the_invitation_keeps_the_body(self):
+        stripped = html_render._strip_invitation(REPORT_BODY + EXPERT_INVITATIONS["general"])
+        self.assertEqual(stripped, REPORT_BODY)
+
+    def test_report_ending_at_the_invitation_renders_ending_at_the_footer(self):
+        rendered = html_render.render_html(
+            _report("Kanye West", ["One"]),
+            synthesis_md=REPORT_BODY + EXPERT_INVITATIONS["general"],
+        )
+        self.assertNotIn("I'm now an expert", rendered)
+        self.assertNotIn("apology letter?", rendered)
+        self.assertIn("Closing pattern stays in the brief", rendered)
+        body = rendered.split('<div class="colophon">', 1)[0].rstrip()
+        self.assertIn("All agents reported back!", body)
+        self.assertTrue(body.endswith("---</pre></div>"), body[-200:])
+
+    def test_comparison_ending_at_the_invitation_renders_ending_at_the_footer(self):
+        rendered = html_render.render_html_comparison(
+            [("Cursor", _report("Cursor", ["One"])), ("Windsurf", _report("Windsurf", ["Two"]))],
+            synthesis_md=REPORT_BODY + COMPARISON_INVITATION,
+        )
+        self.assertNotIn("I've compared", rendered)
+        self.assertNotIn("apology letter?", rendered)
+        self.assertIn("Closing pattern stays in the brief", rendered)
+        self.assertIn("All agents reported back!", rendered)
+
+    def test_old_saved_report_renders_without_the_invitation(self):
+        rendered = html_render.render_html(
+            _report("Kanye West", ["One"]),
+            synthesis_md=REPORT_BODY + EXPERT_INVITATIONS["general"] + OLD_LINK_LINE,
+        )
+        self.assertNotIn("I'm now an expert", rendered)
+        self.assertNotIn("Just ask.", rendered)
+        self.assertIn("<strong>The apology letter</strong>", rendered)
+        self.assertIn("Closing pattern stays in the brief", rendered)
+        self.assertIn('<div class="engine-footer">', rendered)
 
 
 class HtmlCliIntegrationTests(unittest.TestCase):
@@ -271,6 +588,35 @@ class HtmlCliIntegrationTests(unittest.TestCase):
         with self.subTest("suffix"):
             path = cli.compute_save_path_display("/tmp", report.topic, "v3", "html")
             self.assertTrue(path.endswith("/ai-agent-frameworks-raw-html-v3.html"))
+        with self.subTest("suffix_traversal_sanitized"):
+            # A suffix carrying path separators / parent refs must be sanitized
+            # to a flat token so it can never escape the save directory.
+            path = cli.compute_save_path_display("/tmp", report.topic, "../../etc", "html")
+            self.assertNotIn("..", path)
+            self.assertTrue(path.endswith("/ai-agent-frameworks-raw-html-etc.html"))
+
+    def test_save_suffix_cannot_escape_save_directory(self):
+        report = _report("AI Agent Frameworks", [])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = cli.save_output(report, "md", tmpdir, suffix="../../ESCAPED")
+            # The written file stays inside the intended directory, and the
+            # traversal fragment never lands in the filename.
+            self.assertEqual(Path(tmpdir).resolve(), out.parent)
+            self.assertNotIn("..", out.name)
+            self.assertTrue(out.name.startswith("ai-agent-frameworks-raw"))
+
+    def test_discover_save_suffix_cannot_escape_save_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = cli._save_discovery_output(
+                "# discovery\n",
+                domain="AI agents",
+                emit="md",
+                save_dir=tmpdir,
+                suffix="../../ESCAPED",
+            )
+            self.assertEqual(Path(tmpdir).resolve(), out.parent)
+            self.assertNotIn("..", out.name)
+            self.assertTrue(out.name.startswith("ai-agents-discover-raw"))
 
     def test_save_output_can_persist_comparison_html(self):
         reports = [
